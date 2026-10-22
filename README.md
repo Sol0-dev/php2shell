@@ -228,6 +228,29 @@ What each stage means:
 Banner is randomized per run, like an msfconsole splash. Changes on every
 invocation.
 
+## Nuclei templates
+
+The `nuclei-templates/` directory ships two safe detection templates:
+
+| Template | Severity | What it does |
+| -------- | -------- | ------------ |
+| `php-cve-2026-109618-surface.yaml` | medium | confirms the session.upload_progress surface: sends a multipart `PHP_SESSION_UPLOAD_PROGRESS` probe and matches the PHPSESSID init or PHP headers |
+| `php-cve-2026-109618-version-flag.yaml` | info | flags the exact PHP version from headers against the vulnerable branch table above and extracts it |
+
+Run them:
+
+```bash
+nuclei -t nuclei-templates/ -u http://TARGET/
+nuclei -t nuclei-templates/ -l urls.txt -silent
+```
+
+Validated output against the bundled lab:
+
+```
+[php-cve-2026-109618-surface:phpsessid] [medium] http://127.0.0.1:8181/ ["Set-Cookie: PHPSESSID=..."]
+[php-cve-2026-109618-version-flag:vulnerable_php_version] [info] http://127.0.0.1:8181/ ["PHP/8.1.34"]
+```
+
 ## How to recreate the lab locally
 
 The `lab/` directory contains a deliberately vulnerable PHP page
