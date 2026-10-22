@@ -166,6 +166,15 @@ python3 poc.py http://TARGET/index.php "id" -i --lfi-param page
 
 `--interactive` only works with a single target and needs `--lfi-param`.
 
+The shell is designed to be consistent:
+
+- every command gets up to 3 automatic attempts, so a missed race window is
+  retried instead of printing `no output` outright
+- the first successful path wins and is remembered for the rest of the
+  session, so later commands skip the slow full path scan (fast telemetry)
+- commands with quotes are escaped safely before being embedded in the
+  session poison payload
+
 ## Blind RCE with out-of-band exfil
 
 When the target accepts the poisoned session but the LFI response never shows
