@@ -1,0 +1,10 @@
+services:
+  lab:
+    image: php:8.1-apache
+    container_name: php2shell-lab
+    ports:
+      - "127.0.0.1:8181:80"
+    environment:
+      LAB_MODE: "true"
+    volumes:
+      - ./index.php:/var/www/html/index.php:ro
